@@ -1,0 +1,812 @@
+//! Trustchain CLI binary
+use chrono::NaiveDate;
+use clap::{arg, value_parser, ArgAction, Command};
+use core::panic;
+use serde_json::to_string_pretty;
+use ssi::{jsonld::ContextLoader, jwk::Algorithm, ldp::LinkedDataDocument, vc::Credential};
+use std::{
+    fs::File,
+    io::{self, stdin, BufReader, IsTerminal},
+    path::Path,
+    path::PathBuf,
+};
+use trustchain_api::{
+    api::{TrustchainDIDAPI, TrustchainDataAPI, TrustchainRootAPI, TrustchainVCAPI},
+    errors::TrustchainAPIError,
+    TrustchainAPI,
+};
+use trustchain_cli::{config::cli_config, print_status};
+use trustchain_core::{
+    issuer::IssuerError,
+    key_manager::KeyManagerError,
+    resolver::map_resolution_result,
+    utils::extract_keys,
+    vc::{CredentialError, DataCredentialError},
+    verifier::Verifier,
+    JSON_FILE_EXTENSION, TRUSTCHAIN_DATA,
+};
+use trustchain_http::attestor::present_identity_challenge;
+use trustchain_http::{
+    attestation_encryption_utils::ssi_to_josekit_jwk,
+    attestation_utils::{
+        CRState, ElementwiseSerializeDeserialize, IdentityCRInitiation, TrustchainCRError,
+    },
+    requester::{identity_response, initiate_content_challenge, initiate_identity_challenge},
+};
+use trustchain_ion::{
+    attest::attest_operation,
+    create::{create_operation, create_operation_mnemonic},
+    root::RootError,
+    trustchain_resolver,
+    verifier::TrustchainVerifier,
+    CREATE_OPERATION_FILENAME_PREFIX,
+};
+
+fn cli() -> Command {
+    Command::new("Trustchain CLI")
+        .about(format!("Trustchain CLI v{}\n\nTrustchain command line interface for decentralised public key infrastructure.", env!("CARGO_PKG_VERSION")))
+        .version(env!("CARGO_PKG_VERSION"))
+        .author(env!("CARGO_PKG_AUTHORS"))
+        .subcommand_required(true)
+        .arg_required_else_help(true)
+        .allow_external_subcommands(true)
+        .subcommand(
+            Command::new("status")
+                .about("Trustchain node status.")
+                .subcommand_required(false)
+                .arg_required_else_help(false)
+                .allow_external_subcommands(false)
+        )
+        .subcommand(
+            Command::new("did")
+                .about("DID functionality: create, attest, resolve, verify.")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .allow_external_subcommands(true)
+                .subcommand(
+                    Command::new("create")
+                        .about("Creates a new DID from a document state.")
+                        .arg(arg!(-v - -verbose).action(ArgAction::SetTrue))
+                        .arg(arg!(-m - -mnemonic).action(ArgAction::SetTrue))
+                        .arg(arg!(-f --file_path <FILE_PATH>).required(false)),
+                )
+                .subcommand(
+                    Command::new("attest")
+                        .about("Controller attests to a DID.")
+                        .arg(arg!(-v - -verbose).action(ArgAction::SetTrue))
+                        .arg(arg!(-d --did <DID>).required(true))
+                        .arg(arg!(-c --controlled_did <CONTROLLED_DID>).required(true))
+                        .arg(arg!(-k --key_id <KEY_ID>).required(false)),
+                )
+                .subcommand(
+                    Command::new("resolve")
+                        .about("Resolves a DID.")
+                        .arg(arg!(-v - -verbose).action(ArgAction::SetTrue))
+                        .arg(arg!(-d --did <DID>).required(true)),
+                )
+                .subcommand(
+                    Command::new("verify")
+                        .about("Verifies a DID.")
+                        .arg(arg!(-d --did <DID>).required(true))
+                        .arg(arg!(-t --root_event_time <ROOT_EVENT_TIME>).required(false))
+                ),
+        )
+        .subcommand(
+            Command::new("vc")
+                .about("Verifiable credential functionality: sign and verify.")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .allow_external_subcommands(true)
+                .subcommand(
+                    Command::new("sign")
+                        .about("Signs a credential.")
+                        .arg(arg!(-v - -verbose).action(ArgAction::SetTrue))
+                        .arg(arg!(-d --did <DID>).required(true))
+                        .arg(arg!(-f --credential_file <CREDENTIAL_FILE>).required(false))
+                        .arg(arg!(--key_id <KEY_ID>).required(false))
+                        .arg(
+                            arg!(--rss "Sign with an RSS (redactable signature scheme) key.")
+                                .action(ArgAction::SetTrue),
+                        ),
+                )
+                .subcommand(
+                    Command::new("verify")
+                        .about("Verifies a credential.")
+                        .arg(arg!(-v - -verbose).action(ArgAction::Count))
+                        .arg(arg!(-f --credential_file <CREDENTIAL_FILE>).required(false))
+                        .arg(arg!(-t --root_event_time <ROOT_EVENT_TIME>).required(false)),
+                ),
+        )
+        .subcommand(
+            Command::new("data")
+                .about("Data provenance functionality: sign and verify.")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .allow_external_subcommands(true)
+                .subcommand(
+                    Command::new("sign")
+                        .about("Signs the data in the given file.")
+                        .arg(arg!(-v - -verbose).action(ArgAction::SetTrue))
+                        .arg(arg!(-d --did <DID>).required(true))
+                        .arg(arg!(-f --data_file <DATA_FILE>).required(true))
+                        .arg(arg!(--key_id <KEY_ID>).required(false)),
+                )
+                .subcommand(
+                    Command::new("verify")
+                        .about("Verifies a data credential.")
+                        .arg(arg!(-v - -verbose).action(ArgAction::Count))
+                        .arg(arg!(-f --data_file <DATA_FILE>).required(true))
+                        .arg(arg!(-c --credential_file <CREDENTIAL_FILE>).required(false))
+                        .arg(arg!(-t --root_event_time <ROOT_EVENT_TIME>).required(false))
+                ),
+        )
+        .subcommand(
+            Command::new("cr")
+                .about("Challenge-response functionality for downstream DID attestation.")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .allow_external_subcommands(true)
+                .subcommand(
+                    Command::new("identity")
+                        .about("Identity challenge-response functionality: initiate, present, respond.")
+                        .arg(arg!(-v - -verbose).action(ArgAction::SetTrue))
+                        .arg(arg!(-f --file_path <FILE_PATH>).required(false))
+                        .subcommand(
+                            Command::new("initiate")
+                            .about("Initiates a new identity challenge-response process.")
+                            .arg(arg!(-v - -verbose).action(ArgAction::Count))
+                            .arg(arg!(-d --did <ATTESTOR_DID>).required(true))
+                        )
+                        .subcommand(
+                            Command::new("present")
+                            .about("Produce challenge for identity CR to be presented to requestor.")
+                            .arg(arg!(-v - -verbose).action(ArgAction::Count))
+                            .arg(arg!(-p --path <TEMP_P_KEY_ID_FOR_PATH>).required(true))
+                            .arg(arg!(-d --did <ATTESTOR_DID>).required(true))
+                        )
+                        .subcommand(
+                            Command::new("respond")
+                            .about("Produce response for identity challenge to be posted to attestor.")
+                            .arg(arg!(-v - -verbose).action(ArgAction::Count))
+                            .arg(arg!(-p --path <TEMP_P_KEY_ID_FOR_PATH>).required(true))
+                            .arg(arg!(-d --did <ATTESTOR_DID>).required(true))
+                        )
+                )
+                .subcommand(
+                    Command::new("content")
+                        .about("Content challenge-response functionality: initiate, respond.")
+                        .arg(arg!(-v - -verbose).action(ArgAction::SetTrue))
+                        .arg(arg!(-f --file_path <FILE_PATH>).required(false))
+                        .subcommand(
+                            Command::new("initiate")
+                            .about("Initiates the content challenge-response process.")
+                            .arg(arg!(-v - -verbose).action(ArgAction::Count))
+                            .arg(arg!(-d --did <ATTESTOR_DID>).required(true))
+                            .arg(arg!(--ddid <CANDIDATE_DOWNSTREAM_DID>).required(true))
+                            .arg(arg!(-p --path <TEMP_P_KEY_ID_FOR_PATH>).required(true))
+                        )
+                    )
+                .subcommand(
+                    Command::new("complete")
+                        .about("Check if challenge-response for attestation request has been completed.")
+                        .arg(arg!(-v - -verbose).action(ArgAction::SetTrue))
+                        .arg(arg!(-p --path <TEMP_P_KEY_ID_FOR_PATH>).required(true))
+                        .arg(arg!(-e --entity <ATTESTOR_OR_REQUESTER>).required(true))
+                ),
+        )
+        .subcommand(
+            Command::new("root")
+                .about("Root DID functionality: candidates and timestamps.")
+                .subcommand_required(true)
+                .arg_required_else_help(true)
+                .allow_external_subcommands(true)
+                .subcommand(
+                    Command::new("candidates")
+                        .about("Displays candidate root DIDs for a given date.")
+                        .arg(arg!(-y --year <YEAR>).value_parser(value_parser!(i32)).required(true))
+                        .arg(arg!(-m --month <MONTH>).value_parser(value_parser!(u32)).required(true))
+                        .arg(arg!(-d --day <MONTH>).value_parser(value_parser!(u32)).required(true))
+                )
+                .subcommand(
+                    Command::new("blocktime")
+                        .about("Displays the Unix timestamp for a given block height.")
+                        .arg(arg!(-b --height <BLOCK_HEIGHT>).value_parser(value_parser!(u64)).required(true))
+                ),
+        )
+}
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let matches = cli().get_matches();
+    let endpoint = cli_config().ion_endpoint.to_address();
+    let root_event_time: u32 = cli_config().root_event_time;
+    let verifier = TrustchainVerifier::new(trustchain_resolver(&endpoint));
+    let resolver = verifier.resolver();
+    let mut context_loader = ContextLoader::default();
+    match matches.subcommand() {
+        Some(("status", _)) => {
+            print_status().await;
+        }
+        Some(("did", sub_matches)) => {
+            match sub_matches.subcommand() {
+                Some(("create", sub_matches)) => {
+                    let file_path = sub_matches.get_one::<String>("file_path");
+                    let verbose = matches!(sub_matches.get_one::<bool>("verbose"), Some(true));
+                    let mnemonic = matches!(sub_matches.get_one::<bool>("mnemonic"), Some(true));
+                    if mnemonic && file_path.is_some() {
+                        panic!("Please use only one of '--file_path' and '--mnemonic'.")
+                    }
+                    let filename = if !mnemonic {
+                        // Read doc state from file path
+                        let doc_state = if let Some(file_path) = file_path {
+                            Some(serde_json::from_reader(File::open(file_path)?)?)
+                        } else {
+                            None
+                        };
+                        create_operation(doc_state, verbose)?
+                    } else {
+                        let mut mnemonic = String::new();
+                        println!("Enter a mnemonic:");
+                        std::io::stdin().read_line(&mut mnemonic).unwrap();
+                        create_operation_mnemonic(&mnemonic, None)?
+                    };
+                    println!(
+                        "Created new DID: {}",
+                        filename
+                            .strip_prefix(CREATE_OPERATION_FILENAME_PREFIX)
+                            .unwrap_or_else(|| &filename)
+                            .strip_suffix(JSON_FILE_EXTENSION)
+                            .unwrap_or_else(|| &filename)
+                    );
+                }
+                Some(("attest", sub_matches)) => {
+                    let did = sub_matches.get_one::<String>("did").unwrap();
+                    let controlled_did = sub_matches.get_one::<String>("controlled_did").unwrap();
+                    let verbose = matches!(sub_matches.get_one::<bool>("verbose"), Some(true));
+                    let _key_id = sub_matches
+                        .get_one::<String>("key_id")
+                        .map(|string| string.as_str());
+                    // TODO: pass optional key_id
+                    attest_operation(did, controlled_did, verbose).await?;
+                }
+                // TODO: add a flag for update operation with a mnemonic to add a
+                // key generated on mobile to the DID.
+                Some(("resolve", sub_matches)) => {
+                    let did = sub_matches.get_one::<String>("did").unwrap();
+                    let _verbose = matches!(sub_matches.get_one::<bool>("verbose"), Some(true));
+                    let (res_meta, doc, doc_meta) =
+                        map_resolution_result(TrustchainAPI::resolve(did, resolver).await?)?;
+                    // Print results
+                    println!("---");
+                    println!("Document:");
+                    if let Some(doc) = doc {
+                        println!(
+                            "{}",
+                            to_string_pretty(&doc).expect("Cannot convert to JSON.")
+                        );
+                    }
+                    println!("---");
+                    println!("Document metadata:");
+                    if let Some(doc_meta) = doc_meta {
+                        println!(
+                            "{}",
+                            to_string_pretty(&doc_meta).expect("Cannot convert to JSON.")
+                        );
+                    }
+                    println!("Result metadata:");
+                    println!(
+                        "{}",
+                        to_string_pretty(&res_meta).expect("Cannot convert to JSON.")
+                    );
+                }
+                Some(("verify", sub_matches)) => {
+                    let did = sub_matches.get_one::<String>("did").unwrap();
+                    let root_event_time = match sub_matches.get_one::<String>("root_event_time") {
+                        Some(time) => time.parse::<u32>().unwrap(),
+                        None => cli_config().root_event_time,
+                    };
+                    let did_chain =
+                        TrustchainAPI::verify(did, root_event_time.into(), &verifier).await?;
+                    println!("{did_chain}");
+                }
+                _ => panic!("Unrecognised DID subcommand."),
+            }
+        }
+        Some(("vc", sub_matches)) => {
+            let verifier = TrustchainVerifier::new(trustchain_resolver(&endpoint));
+            let resolver = verifier.resolver();
+            match sub_matches.subcommand() {
+                Some(("sign", sub_matches)) => {
+                    let did = sub_matches.get_one::<String>("did").unwrap();
+                    let key_id = sub_matches
+                        .get_one::<String>("key_id")
+                        .map(|string| string.as_str());
+                    let algorithm = sub_matches.get_flag("rss").then_some(Algorithm::RSS2023);
+                    let credential =
+                        read_credential(sub_matches.get_one::<String>("credential_file"));
+
+                    let credential_with_proof = match TrustchainAPI::sign(
+                        credential,
+                        did,
+                        None,
+                        key_id,
+                        algorithm,
+                        resolver,
+                        &mut context_loader,
+                    )
+                    .await
+                    {
+                        Ok(credential) => credential,
+                        Err(TrustchainAPIError::IssuerError(IssuerError::KeyManager(
+                            KeyManagerError::FailedToLoadKey,
+                        ))) => {
+                            if let (Some(key_id), Some(Algorithm::RSS2023)) = (key_id, algorithm) {
+                                eprintln!(
+                                    "Failed to issue credential. No RSS signing key with ID {:?} was found for this issuer.",
+                                    key_id
+                                );
+                            } else if algorithm == Some(Algorithm::RSS2023) {
+                                eprintln!(
+                                    "Failed to issue credential. No RSS signing key was found for this issuer."
+                                );
+                            } else if let Some(key_id) = key_id {
+                                eprintln!(
+                                    "Failed to issue credential. No signing key with ID {:?} was found for this issuer.",
+                                    key_id
+                                );
+                            } else {
+                                eprintln!(
+                                    "Failed to issue credential. No signing key was found for this issuer."
+                                );
+                            }
+                            std::process::exit(1);
+                        }
+                        Err(e) => panic!("Failed to issue credential.: {:?}", e),
+                    };
+                    println!("{}", &to_string_pretty(&credential_with_proof).unwrap());
+                }
+                Some(("verify", sub_matches)) => {
+                    let verbose = sub_matches.get_one::<u8>("verbose");
+                    let root_event_time = match sub_matches.get_one::<String>("root_event_time") {
+                        Some(time) => time.parse::<u64>().unwrap(),
+                        None => cli_config().root_event_time.into(),
+                    };
+                    // Deserialize
+                    let credential =
+                        read_credential(sub_matches.get_one::<String>("credential_file"));
+                    // Verify credential
+                    let verify_result = TrustchainAPI::verify_credential(
+                        &credential,
+                        None,
+                        root_event_time,
+                        &verifier,
+                        &mut context_loader,
+                    )
+                    .await;
+                    // Handle result
+                    match verify_result {
+                        Ok(_) => {
+                            println!("Proof.... ✅");
+                            println!("Issuer... ✅");
+                        }
+                        Err(err) => match err {
+                            TrustchainAPIError::FailedToVerifyCredential(e) => {
+                                handle_credential_error(e)?;
+                            }
+                            _ => {
+                                println!("Verify.. ❌ Failed (with API error)");
+                            }
+                        },
+                    }
+
+                    // Show chain
+                    if let Some(&verbose_count) = verbose {
+                        let issuer = credential
+                            .get_issuer()
+                            .expect("No issuer present in credential.");
+                        let chain = TrustchainAPI::verify(issuer, root_event_time, &verifier)
+                            .await
+                            // Can unwrap as already verified above.
+                            .unwrap();
+                        if verbose_count > 1 {
+                            let (_, doc, doc_meta) =
+                                resolver.resolve_as_result(issuer).await.unwrap();
+                            println!("---");
+                            println!("Issuer DID doc:");
+                            println!("{}", &to_string_pretty(&doc.as_ref().unwrap()).unwrap());
+                            println!("---");
+                            println!("Issuer DID doc metadata:");
+                            println!(
+                                "{}",
+                                &to_string_pretty(&doc_meta.as_ref().unwrap()).unwrap()
+                            );
+                        }
+                        if verbose_count > 0 {
+                            println!("---");
+                            println!("Chain:");
+                            println!("{}", chain);
+                            println!("---");
+                        }
+                    }
+                }
+                _ => panic!("Unrecognised VC subcommand."),
+            }
+        }
+        Some(("cr", sub_matches)) => match sub_matches.subcommand() {
+            Some(("identity", sub_matches)) => match sub_matches.subcommand() {
+                Some(("initiate", sub_matches)) => {
+                    // verify DID before resolving and extracting endpoint
+                    let did = sub_matches.get_one::<String>("did").unwrap();
+                    let _result = verifier.verify(did, root_event_time.into()).await?;
+                    let (_, doc, _) =
+                        map_resolution_result(TrustchainAPI::resolve(did, resolver).await?)?;
+                    let services = doc.unwrap().service;
+
+                    // user promt for org name and operator name
+                    println!("Please enter your organisation name: ");
+                    let mut org_name = String::new();
+                    io::stdin()
+                        .read_line(&mut org_name)
+                        .expect("Failed to read line");
+
+                    let mut op_name = String::new();
+                    println!("Please enter your operator name: ");
+                    io::stdin()
+                        .read_line(&mut op_name)
+                        .expect("Failed to read line");
+
+                    println!("Organisation name: {}", org_name);
+                    println!("Operator name: {}", op_name);
+                    // initiate identity challenge
+                    let (identity_cr_initiation, path) = initiate_identity_challenge(
+                        org_name.trim(),
+                        op_name.trim(),
+                        &services.unwrap(),
+                    )
+                    .await?;
+                    identity_cr_initiation.elementwise_serialize(&path)?;
+                    println!("Successfully initiated attestation request.");
+                    println!(
+                        "You will receive more information on the challenge-response process via alternative communication channel."
+                    );
+                }
+                Some(("present", sub_matches)) => {
+                    // get attestation request path from provided input
+                    let trustchain_dir: String = std::env::var(TRUSTCHAIN_DATA)
+                        .map_err(|_| TrustchainCRError::FailedAttestationRequest)?;
+                    let path_to_check = sub_matches.get_one::<String>("path").unwrap();
+                    let did = sub_matches.get_one::<String>("did").unwrap();
+                    let path = PathBuf::new()
+                        .join(trustchain_dir)
+                        .join("attestor")
+                        .join("attestation_requests")
+                        .join(path_to_check);
+                    if !path.exists() {
+                        panic!("Provided attestation request not found. Path does not exist.");
+                    }
+                    let identity_initiation = IdentityCRInitiation::new()
+                        .elementwise_deserialize(&path)
+                        .unwrap();
+                    // Show requester information to user and ask for confirmation to proceed
+                    println!("---------------------------------");
+                    println!("Requester information: ");
+                    println!(
+                        "{:?}",
+                        identity_initiation
+                            .as_ref()
+                            .unwrap()
+                            .requester_details
+                            .as_ref()
+                            .unwrap()
+                    );
+                    println!("---------------------------------");
+                    println!("Recognise this attestation request and want to proceed? (y/n)");
+                    let mut prompt = String::new();
+                    io::stdin()
+                        .read_line(&mut prompt)
+                        .expect("Failed to read line");
+                    let prompt = prompt.trim();
+                    if prompt != "y" && prompt != "yes" {
+                        println!("Aborting attestation request.");
+                        return Ok(());
+                    }
+
+                    let temp_p_key = identity_initiation.unwrap().temp_p_key.unwrap();
+
+                    // call function to present challenge
+                    let identity_challenge = present_identity_challenge(did, &temp_p_key)?;
+
+                    // print signed and encrypted payload to terminal
+                    let payload = identity_challenge
+                        .identity_challenge_signature
+                        .as_ref()
+                        .unwrap();
+                    println!("---------------------------------");
+                    println!("Signed and encrypted challenge:");
+                    println!("{:?}", payload);
+                    println!("---------------------------------");
+                    println!("Please send the above challenge to the requester via alternative channels.");
+                    println!("Before responding using the 'respond' subcommand, the requester has to save the challenge to a file named 'identity_challenge_signature.json' in the corresponding attestation request directory.");
+                    println!("---------------------------------");
+
+                    // serialise struct
+                    identity_challenge.elementwise_serialize(&path)?;
+                }
+                Some(("respond", sub_matches)) => {
+                    // get attestation request path from provided input
+                    let trustchain_dir: String = std::env::var(TRUSTCHAIN_DATA)
+                        .map_err(|_| TrustchainCRError::FailedAttestationRequest)?;
+                    let path_to_check = sub_matches.get_one::<String>("path").unwrap();
+                    let path = PathBuf::new()
+                        .join(trustchain_dir)
+                        .join("requester")
+                        .join("attestation_requests")
+                        .join(path_to_check);
+                    if !path.exists() {
+                        panic!("Provided attestation request not found. Path does not exist.");
+                    }
+                    let did = sub_matches.get_one::<String>("did").unwrap();
+                    let (_, doc, _) =
+                        map_resolution_result(TrustchainAPI::resolve(did, resolver).await?)?;
+                    let doc = doc.unwrap();
+                    // extract attestor public key from did document
+                    let public_keys = extract_keys(&doc);
+                    let attestor_public_key_ssi = public_keys.first().unwrap();
+                    let public_key = ssi_to_josekit_jwk(attestor_public_key_ssi).unwrap();
+                    // service endpoint
+                    let services = doc.service.unwrap();
+                    let identity_challenge_response =
+                        identity_response(&path, &services, &public_key).await?;
+                    // serialise struct
+                    identity_challenge_response.elementwise_serialize(&path)?;
+                }
+                _ => panic!("Unrecognised CR identity subcommand."),
+            },
+            Some(("content", sub_matches)) => match sub_matches.subcommand() {
+                Some(("initiate", sub_matches)) => {
+                    let did = sub_matches.get_one::<String>("did").unwrap();
+                    let ddid = sub_matches.get_one::<String>("ddid").unwrap();
+                    let path_to_check = sub_matches.get_one::<String>("path").unwrap();
+
+                    // check attestation request path
+                    let trustchain_dir: String = std::env::var(TRUSTCHAIN_DATA)
+                        .map_err(|_| TrustchainCRError::FailedAttestationRequest)?;
+                    let path = PathBuf::new()
+                        .join(trustchain_dir)
+                        .join("requester")
+                        .join("attestation_requests")
+                        .join(path_to_check);
+                    if !path.exists() {
+                        panic!("Provided attestation request not found. Path does not exist.");
+                    }
+
+                    // resolve DID, get services and attestor public key
+                    let (_, doc, _) =
+                        map_resolution_result(TrustchainAPI::resolve(did, resolver).await?)?;
+                    let doc = doc.unwrap();
+                    let public_keys = extract_keys(&doc);
+                    let attestor_public_key_ssi = public_keys.first().unwrap();
+                    let attestor_public_key = ssi_to_josekit_jwk(attestor_public_key_ssi).unwrap();
+                    let services = &doc.service.unwrap();
+
+                    let (content_initiation, content_challenge) =
+                        initiate_content_challenge(&path, ddid, services, &attestor_public_key)
+                            .await?;
+                    content_initiation.elementwise_serialize(&path)?;
+                    content_challenge.elementwise_serialize(&path)?;
+                }
+                _ => panic!("Unrecognised CR content subcommand."),
+            },
+            Some(("complete", sub_matches)) => {
+                let path_to_check = sub_matches.get_one::<String>("path").unwrap();
+                let entity = sub_matches.get_one::<String>("entity").unwrap();
+                let trustchain_dir: String = std::env::var(TRUSTCHAIN_DATA)
+                    .map_err(|_| TrustchainCRError::FailedAttestationRequest)?;
+                let path = PathBuf::new()
+                    .join(trustchain_dir)
+                    .join(entity)
+                    .join("attestation_requests")
+                    .join(path_to_check);
+                let cr_state = CRState::new()
+                    .elementwise_deserialize(&path)
+                    .unwrap()
+                    .unwrap();
+                let current_state = cr_state.check_cr_status().unwrap();
+
+                println!(
+                    "State of attestation challenge-response process: {:?}",
+                    current_state
+                );
+            }
+            _ => panic!("Unrecognised CR subcommand."),
+        },
+        Some(("data", sub_matches)) => {
+            let verifier = TrustchainVerifier::new(trustchain_resolver(&endpoint));
+            let resolver = verifier.resolver();
+            match sub_matches.subcommand() {
+                Some(("sign", sub_matches)) => {
+                    let did = sub_matches.get_one::<String>("did").unwrap();
+                    let key_id = sub_matches
+                        .get_one::<String>("key_id")
+                        .map(|string| string.as_str());
+                    let data = Path::new(sub_matches.get_one::<String>("data_file").unwrap());
+                    let bytes = std::fs::read(data)?;
+
+                    let data_with_proof = TrustchainAPI::sign_data(
+                        &bytes,
+                        did,
+                        None,
+                        key_id,
+                        resolver,
+                        &mut context_loader,
+                    )
+                    .await
+                    .expect("Failed to sign data.");
+                    println!("{}", &to_string_pretty(&data_with_proof).unwrap());
+                }
+                Some(("verify", sub_matches)) => {
+                    let verbose = sub_matches.get_one::<u8>("verbose");
+                    let root_event_time = match sub_matches.get_one::<String>("root_event_time") {
+                        Some(time) => time.parse::<u64>().unwrap(),
+                        None => cli_config().root_event_time.into(),
+                    };
+                    let data = Path::new(sub_matches.get_one::<String>("data_file").unwrap());
+                    // Deserialize
+                    let credential =
+                        read_credential(sub_matches.get_one::<String>("credential_file"));
+                    let bytes = std::fs::read(data)?;
+
+                    let verify_result = TrustchainAPI::verify_data(
+                        &bytes,
+                        &credential,
+                        None,
+                        root_event_time,
+                        &verifier,
+                        &mut context_loader,
+                    )
+                    .await;
+                    // Handle result
+                    match verify_result {
+                        Ok(_) => {
+                            println!("Proof.... ✅");
+                            println!("Issuer... ✅");
+                            println!("Digest... ✅");
+                        }
+                        Err(TrustchainAPIError::FailedToVerifyDataCredential(
+                            DataCredentialError::CredentialError(cred_err),
+                        )) => {
+                            handle_credential_error(cred_err)?;
+                        }
+                        Err(TrustchainAPIError::FailedToVerifyDataCredential(data_cred_err)) => {
+                            handle_data_credential_error(data_cred_err)?;
+                        }
+                        _ => {
+                            println!("Verify.. ❌ Failed (with API error)");
+                        }
+                    };
+                    // Show chain
+                    if let Some(&verbose_count) = verbose {
+                        let issuer = credential
+                            .get_issuer()
+                            .expect("No issuer present in credential.");
+                        let chain = TrustchainAPI::verify(issuer, root_event_time, &verifier)
+                            .await
+                            // Can unwrap as already verified above.
+                            .unwrap();
+                        // TODO: avoid repetition (see vc subcommand above):
+                        if verbose_count > 1 {
+                            let (_, doc, doc_meta) =
+                                resolver.resolve_as_result(issuer).await.unwrap();
+                            println!("---");
+                            println!("Issuer DID doc:");
+                            println!("{}", &to_string_pretty(&doc.as_ref().unwrap()).unwrap());
+                            println!("---");
+                            println!("Issuer DID doc metadata:");
+                            println!(
+                                "{}",
+                                &to_string_pretty(&doc_meta.as_ref().unwrap()).unwrap()
+                            );
+                        }
+                        if verbose_count > 0 {
+                            println!("---");
+                            println!("Chain:");
+                            println!("{}", chain);
+                            println!("---");
+                        }
+                    }
+                }
+                _ => panic!("Unrecognised DATA subcommand."),
+            }
+        }
+        Some(("root", sub_matches)) => match sub_matches.subcommand() {
+            Some(("candidates", sub_matches)) => {
+                let year = sub_matches.get_one::<i32>("year").unwrap();
+                let month = sub_matches.get_one::<u32>("month").unwrap();
+                let day = sub_matches.get_one::<u32>("day").unwrap();
+
+                let date = match NaiveDate::from_ymd_opt(*year, *month, *day) {
+                    Some(d) => d,
+                    None => return Err(RootError::InvalidDate(*year, *month, *day).into()),
+                };
+                let root_candidates = TrustchainAPI::root_candidates(date, None)
+                    .await
+                    .expect("Failed to identify root DID candidates");
+                println!("{}", &to_string_pretty(&root_candidates).unwrap());
+            }
+            Some(("blocktime", sub_matches)) => {
+                let height = sub_matches.get_one::<u64>("height").unwrap();
+
+                let timestamp = TrustchainAPI::block_timestamp(*height)
+                    .await
+                    .expect("Failed to get block timestamp");
+                println!("{}", &to_string_pretty(&timestamp).unwrap());
+            }
+            _ => panic!("Unrecognised Root subcommand."),
+        },
+        _ => panic!("Unrecognised subcommand."),
+    }
+    Ok(())
+}
+
+/// Reads a credential from the given file path or, if no path is given, from standard input.
+/// Exits with an error message if no path is given and standard input is a terminal.
+fn read_credential(path: Option<&String>) -> Credential {
+    if let Some(path) = path {
+        serde_json::from_reader(&*std::fs::read(path).unwrap()).unwrap()
+    } else {
+        if stdin().is_terminal() {
+            eprintln!(
+                "No credential provided: use --credential_file or pipe a credential via standard input."
+            );
+            std::process::exit(1);
+        }
+        serde_json::from_reader(BufReader::new(stdin())).unwrap()
+    }
+}
+
+fn handle_credential_error(err: CredentialError) -> Result<(), CredentialError> {
+    match err {
+        CredentialError::VerificationResultError(_) => {
+            println!("Proof... ❌ Invalid");
+        }
+        CredentialError::NoProofPresent => {
+            println!("Proof... ❌ (missing proof)");
+        }
+        CredentialError::MissingVerificationMethod => {
+            println!("Proof... ❌ (missing verification method)");
+        }
+        CredentialError::NoIssuerPresent => {
+            println!("Proof.... ✅");
+            println!("Issuer... ❌ (missing issuer)");
+        }
+        CredentialError::VerifierError(_) => {
+            println!("Proof.... ✅");
+            println!("Issuer... ❌ (with verifier error)");
+        }
+        CredentialError::FailedToDecodeJWT => {
+            println!("Proof.... ❌");
+            println!("Issuer... ❌");
+        }
+    }
+    Err(err)
+}
+
+fn handle_data_credential_error(err: DataCredentialError) -> Result<(), DataCredentialError> {
+    match err {
+        DataCredentialError::MismatchedHashDigests(_, _) => {
+            println!("Digest... ❌ (mismatched data hash digests)");
+        }
+        DataCredentialError::MissingAttribute(ref att) => {
+            println!("Invalid credential... ❌ (missing attribute: \"{att}\")");
+        }
+        DataCredentialError::ManyCredentialSubject(ref subjects) => {
+            println!(
+                "Invalid credential... ❌ (only one subject permitted, multiple subjects found: {subjects:?})"
+            );
+        }
+        DataCredentialError::CredentialError(cred_err) => {
+            return handle_credential_error(cred_err).map_err(DataCredentialError::CredentialError);
+        }
+    }
+    Err(err)
+}
